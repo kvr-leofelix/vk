@@ -1,0 +1,225 @@
+/*
+ * G68 Intelligent Mining Helmet - BASE STATION firmware
+ * Board : second ESP32-DevKitC-32E + SX1278 Ra-02 (same SPI wiring as the helmet)
+ *
+ * What it does
+ *   - Receives helmet LoRa packets and checks them
+ *   - Creates its own WiFi network (no router needed): connect a phone or laptop to it
+ *   - Serves a live dashboard at http://192.168.4.1
+ *   - Raises a buzzer when any helmet is in DANGER or stops reporting (signal lost)
+ *   - Prints every packet as a CSV line on Serial (115200) for your test log
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ---- pins (same as helmet radio wiring) ----
+const int PIN_LORA_SCK = 18, PIN_LORA_MISO = 19, PIN_LORA_MOSI = 23;
+const int PIN_LORA_NSS = 5, PIN_LORA_RST = 14, PIN_LORA_DIO0 = 4;
+const int PIN_BUZZER = 26;           // optional: transistor + buzzer as on the helmet. Set to -1 if not fitted.
+
+// ---- settings (LoRa values MUST match the helmet) ----
+#define LORA_FREQ       433E6
+#define LORA_SYNC_WORD  0x5A
+const char* AP_SSID = "G68-MineHelmet";
+const char* AP_PASS = "helmet2026";          // at least 8 characters
+const uint32_t STALE_MS = 8000;              // dashboard shows NO SIGNAL after this
+const uint32_t LOST_ALARM_MS = 30000;        // buzzer if a known helmet is silent this long
+const int MAX_NODES = 4;
+
+struct __attribute__((packed)) Packet {      // identical to the helmet sketch
+  uint8_t magic, ver, id, level, tier, faults;
+  uint16_t flags, seq;
+  uint16_t pm1, pm25, pm10;
+  uint16_t ch4, co, h2s10, o2_100;
+  int16_t temp100;
+  uint16_t hum100, vbat_mv, rpm, h2sMems_mv;
+  uint8_t xorsum;
+};
+
+struct Node {
+  bool seen = false;
+  uint32_t lastMs = 0;
+  int rssi = 0;
+  float snr = 0;
+  uint32_t rx = 0, lost = 0;
+  uint16_t lastSeq = 0;
+  Packet p;
+};
+
+Node nodes[MAX_NODES];
+WebServer server(80);
+
+// ---------------- dashboard page ----------------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>G68 Mine Helmet</title>
+<style>
+body{font-family:Arial,sans-serif;background:#10151c;color:#e8edf2;margin:0;padding:12px}
+h1{font-size:18px;margin:0 0 10px}
+#banner{padding:14px;border-radius:10px;font-weight:bold;font-size:20px;text-align:center;margin-bottom:12px}
+.ok{background:#1e7e34}.warn{background:#b7791f}.danger{background:#c0392b}.none{background:#566573}
+.card{background:#18212b;border-radius:12px;padding:12px;margin-bottom:12px;border-left:8px solid #566573}
+.card.l0{border-color:#2ecc71}.card.l1{border-color:#f1c40f}.card.l2{border-color:#e74c3c}.card.stale{border-color:#7f8c8d;opacity:.6}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.m{background:#10151c;border-radius:8px;padding:8px}.m b{display:block;font-size:18px}.m span{font-size:11px;color:#9aa7b4}
+.chip{display:inline-block;background:#c0392b;border-radius:10px;padding:2px 8px;margin:2px;font-size:12px}
+.chip.n{background:#34495e}
+canvas{width:100%;height:50px;margin-top:8px;background:#10151c;border-radius:8px}
+small{color:#9aa7b4}
+</style></head><body>
+<h1>G68 Intelligent Mining Helmet - base station</h1>
+<div id="banner" class="none">Waiting for helmets...</div>
+<div id="cards"></div>
+<small>Gas values are estimates from low-cost sensors. Use them as alerts, not as certified readings.</small>
+<script>
+const FLAGS=[[0,'FALL'],[1,'WORKER DOWN (tilt)'],[2,'WARMING UP'],[3,'GAS UNCALIBRATED'],[4,'BATTERY LOW'],[5,'BATTERY CRITICAL'],[6,'HIGH DUST'],[7,'HOT'],[8,'O2 HIGH'],[9,'BUZZER MUTED']];
+const FAULTS=[[0,'BME280'],[1,'IMU'],[2,'O2'],[3,'PMS5003'],[4,'MQ-4'],[5,'MQ-7'],[6,'MQ-136']];
+const hist={};
+function chips(v,list,cls){let s='';for(const [b,t] of list) if(v&(1<<b)) s+='<span class="chip '+cls+'">'+t+'</span>';return s;}
+function spark(id,arr){const c=document.getElementById('c'+id);if(!c)return;const g=c.getContext('2d');c.width=c.clientWidth;c.height=50;
+ g.clearRect(0,0,c.width,50);if(arr.length<2)return;const mx=Math.max(50,...arr);g.strokeStyle='#4aa3ff';g.beginPath();
+ arr.forEach((v,i)=>{const x=i*(c.width/(arr.length-1)),y=48-(v/mx)*44;i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();}
+async function tick(){
+ try{
+  const r=await fetch('/api');const d=await r.json();let worst=-1,html='';
+  for(const n of d.nodes){
+   const stale=n.age>d.stale;const lv=stale?-1:n.level;worst=Math.max(worst,lv);
+   (hist[n.id]=hist[n.id]||[]).push(n.pm25);if(hist[n.id].length>60)hist[n.id].shift();
+   html+='<div class="card '+(stale?'stale':'l'+n.level)+'"><b>Helmet '+n.id+'</b> - '+(stale?'NO SIGNAL':['OK','WARNING','DANGER'][n.level])
+    +' <small>(last packet '+n.age.toFixed(0)+' s ago, RSSI '+n.rssi+' dBm, SNR '+n.snr.toFixed(1)+', lost '+n.lost+')</small>'
+    +'<div>'+chips(n.flags,FLAGS,'')+chips(n.faults,FAULTS,'n')+'</div><div class="grid">'
+    +'<div class="m"><b>'+n.pm25+'</b><span>PM2.5 ug/m3</span></div><div class="m"><b>'+n.pm10+'</b><span>PM10 ug/m3</span></div>'
+    +'<div class="m"><b>'+['LOW','MED','HIGH'][n.tier]+' / '+n.rpm+'</b><span>fan tier / rpm</span></div>'
+    +'<div class="m"><b>'+n.ch4+'</b><span>CH4 ppm (est.)</span></div><div class="m"><b>'+n.co+'</b><span>CO ppm (est.)</span></div>'
+    +'<div class="m"><b>'+n.h2s.toFixed(1)+'</b><span>H2S ppm (est.)</span></div>'
+    +'<div class="m"><b>'+n.o2.toFixed(1)+'%</b><span>O2</span></div><div class="m"><b>'+n.temp.toFixed(1)+' C / '+n.hum.toFixed(0)+'%</b><span>temp / humidity</span></div>'
+    +'<div class="m"><b>'+n.vbat.toFixed(1)+' V</b><span>battery</span></div></div>'
+    +'<canvas id="c'+n.id+'"></canvas></div>';
+  }
+  document.getElementById('cards').innerHTML=html;
+  for(const n of d.nodes)spark(n.id,hist[n.id]||[]);
+  const b=document.getElementById('banner');
+  if(worst<0&&!d.nodes.length){b.className='none';b.textContent='Waiting for helmets...';}
+  else if(worst<0){b.className='none';b.textContent='NO SIGNAL FROM ANY HELMET';}
+  else{b.className=['ok','warn','danger'][worst];b.textContent=['ALL OK','WARNING','DANGER - EVACUATE'][worst];}
+ }catch(e){}
+}
+setInterval(tick,1000);tick();
+</script></body></html>
+)rawliteral";
+
+// ---------------- helpers ----------------
+bool packetValid(const Packet& p) {
+  if (p.magic != 0xA5 || p.ver != 1) return false;
+  uint8_t x = 0; const uint8_t* b = (const uint8_t*)&p;
+  for (size_t i = 0; i < sizeof(Packet) - 1; i++) x ^= b[i];
+  return x == p.xorsum;
+}
+
+void handleLoRa() {
+  int sz = LoRa.parsePacket();
+  if (sz != (int)sizeof(Packet)) {
+    while (LoRa.available()) LoRa.read();         // discard foreign or damaged packets
+    return;
+  }
+  Packet p;
+  uint8_t* b = (uint8_t*)&p;
+  for (size_t i = 0; i < sizeof(Packet); i++) b[i] = LoRa.read();
+  if (!packetValid(p) || p.id < 1 || p.id > MAX_NODES) return;
+
+  Node& n = nodes[p.id - 1];
+  if (n.seen) {
+    uint16_t gap = (uint16_t)(p.seq - n.lastSeq);
+    if (gap > 1 && gap < 1000) n.lost += gap - 1;
+  }
+  n.seen = true; n.lastMs = millis(); n.lastSeq = p.seq; n.p = p; n.rx++;
+  n.rssi = LoRa.packetRssi(); n.snr = LoRa.packetSnr();
+
+  Serial.printf("RX,%u,%u,%d,%.1f,%u,%u,%u,%u,%u,%u,%u,%.1f,%.2f,%.1f,%.0f,%.2f,%u,%u,%u\n",
+                p.id, p.seq, n.rssi, n.snr, p.level, p.tier, p.pm1, p.pm25, p.pm10, p.ch4, p.co,
+                p.h2s10 / 10.0, p.o2_100 / 100.0, p.temp100 / 100.0, p.hum100 / 100.0, p.vbat_mv / 1000.0,
+                p.rpm, p.flags, p.faults);
+}
+
+void handleApi() {
+  String s = F("{\"stale\":");
+  s += String(STALE_MS / 1000.0, 0);
+  s += F(",\"nodes\":[");
+  bool first = true;
+  for (int i = 0; i < MAX_NODES; i++) {
+    const Node& n = nodes[i];
+    if (!n.seen) continue;
+    const Packet& p = n.p;
+    if (!first) s += ',';
+    first = false;
+    s += F("{\"id\":");      s += p.id;
+    s += F(",\"age\":");     s += String((millis() - n.lastMs) / 1000.0, 1);
+    s += F(",\"rssi\":");    s += n.rssi;
+    s += F(",\"snr\":");     s += String(n.snr, 1);
+    s += F(",\"lost\":");    s += n.lost;
+    s += F(",\"level\":");   s += p.level;
+    s += F(",\"tier\":");    s += (p.tier > 2 ? 2 : p.tier);
+    s += F(",\"flags\":");   s += p.flags;
+    s += F(",\"faults\":");  s += p.faults;
+    s += F(",\"pm1\":");     s += p.pm1;
+    s += F(",\"pm25\":");    s += p.pm25;
+    s += F(",\"pm10\":");    s += p.pm10;
+    s += F(",\"ch4\":");     s += p.ch4;
+    s += F(",\"co\":");      s += p.co;
+    s += F(",\"h2s\":");     s += String(p.h2s10 / 10.0, 1);
+    s += F(",\"o2\":");      s += String(p.o2_100 / 100.0, 2);
+    s += F(",\"temp\":");    s += String(p.temp100 / 100.0, 1);
+    s += F(",\"hum\":");     s += String(p.hum100 / 100.0, 0);
+    s += F(",\"vbat\":");    s += String(p.vbat_mv / 1000.0, 2);
+    s += F(",\"rpm\":");     s += p.rpm;
+    s += '}';
+  }
+  s += F("]}");
+  server.send(200, "application/json", s);
+}
+
+void updateBuzzer() {
+  if (PIN_BUZZER < 0) return;
+  bool alarm = false;
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (!nodes[i].seen) continue;
+    if (now - nodes[i].lastMs > LOST_ALARM_MS) alarm = true;           // signal lost
+    else if (nodes[i].p.level >= 2) alarm = true;                       // DANGER
+  }
+  digitalWrite(PIN_BUZZER, (alarm && (now % 600) < 300) ? HIGH : LOW);
+}
+
+void setup() {
+  Serial.begin(115200);
+  if (PIN_BUZZER >= 0) pinMode(PIN_BUZZER, OUTPUT);
+
+  SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
+  LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println(F("LoRa init failed: check wiring, 3.3 V supply and the antenna."));
+  } else {
+    LoRa.setSpreadingFactor(9); LoRa.setSignalBandwidth(125E3); LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(LORA_SYNC_WORD); LoRa.enableCrc();
+    LoRa.receive();
+    Serial.println(F("LoRa receiver ready."));
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  server.on("/", []() { server.send_P(200, "text/html", PAGE); });
+  server.on("/api", handleApi);
+  server.begin();
+  Serial.printf("WiFi: %s  password: %s  -> open http://%s\n", AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
+  Serial.println(F("CSV: RX,id,seq,rssi,snr,level,tier,pm1,pm25,pm10,ch4,co,h2s,o2,temp,hum,vbat,rpm,flags,faults"));
+}
+
+void loop() {
+  handleLoRa();
+  server.handleClient();
+  updateBuzzer();
+}

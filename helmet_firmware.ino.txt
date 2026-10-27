@@ -1,0 +1,540 @@
+/*
+ * G68 Intelligent Mining Helmet - HELMET firmware
+ * Board : ESP32-DevKitC-32E (ESP32 Dev Module)
+ * Pins  : match Helmet_Schematic_1..5 (ESP32 pin table)
+ *
+ * What it does
+ *   - Reads PMS5003 (dust), MQ-4 / MQ-7 / MQ-136 (gas), O2, BME280, MPU6050, battery
+ *   - Fuses them into one hazard level: 0 = OK, 1 = WARNING, 2 = DANGER
+ *   - Drives the blower speed from the dust level (with a fusion boost, see updateFanTier)
+ *   - Sets LEDs and buzzer, and sends a LoRa packet to the base station
+ *   - Prints one CSV line per second on Serial (115200) for your test log
+ *
+ * IMPORTANT
+ *   - Gas ppm values from MQ sensors are ESTIMATES (cross-sensitive, drift). Treat as alert levels.
+ *   - MQ sensors need warm-up and a clean-air calibration (serial command 'c') before gas alarms work.
+ *   - The P100 filter stops dust only. Gas readings raise alarms; they do not clean the air.
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Adafruit_BME280.h>
+#include <Preferences.h>
+#include <DFRobot_OxygenSensor.h>
+
+// ======================= PIN MAP (from schematic) =======================
+const int PIN_SDA = 21, PIN_SCL = 22;
+const int PIN_LORA_SCK = 18, PIN_LORA_MISO = 19, PIN_LORA_MOSI = 23;
+const int PIN_LORA_NSS = 5, PIN_LORA_RST = 14, PIN_LORA_DIO0 = 4;
+const int PIN_PMS_RX = 16;   // ESP32 RX2  <- PMS5003 TX
+const int PIN_PMS_TX = 17;   // ESP32 TX2  -> PMS5003 RX
+const int PIN_MQ4 = 34, PIN_MQ7 = 35, PIN_MQ136 = 32;
+const int PIN_H2S_MEMS = 33, PIN_VBAT = 36;
+const int PIN_BLOWER1 = 25, PIN_BLOWER2 = 15, PIN_TACH = 39;
+const int PIN_BUZZER = 26, PIN_LED_GRN = 13, PIN_LED_YEL = 27, PIN_LED_RED = 2;
+
+// ======================= SETTINGS YOU MAY CHANGE =======================
+#define HELMET_ID          1
+#define WARMUP_MS          (20UL * 60UL * 1000UL)  // use 60000UL on the bench only
+#define LORA_FREQ          433E6
+#define LORA_TX_DBM        10     // keep low for bench tests; check local rules before raising
+#define LORA_SYNC_WORD     0x5A
+#define TX_PERIOD_OK_MS    2000
+#define TX_PERIOD_ALERT_MS 1000
+
+// Sensors fitted? set 0 to stop reporting a fault for parts you have not wired yet
+#define USE_BME280 1
+#define USE_IMU    1
+#define USE_O2     1
+#define USE_PMS    1
+
+// Divider on every MQ output: 10k series, 15k to GND  -> sensor volts = ADC volts * 25/15
+const float MQ_DIV_RATIO = 25.0f / 15.0f;
+const float MQ_VCC = 5.0f;          // measure your buck output and put the real value here
+const float MQ_RL_KOHM = 10.0f;     // load resistor on the module (cancels out of the ppm ratio)
+
+// Battery divider: R9 = 100k from Vbat, R10 = 22k to GND  (3S pack assumed)
+const float VBAT_DIV_RATIO = (100.0f + 22.0f) / 22.0f;
+const float VBAT_WARN_V = 10.2f, VBAT_CRIT_V = 9.0f;
+
+// Alarm thresholds (starting values: confirm with your mentor / mine rules, then tune on test data)
+const float CH4_WARN = 5000, CH4_DANGER = 10000;   // ppm (about 10% / 20% of LEL)
+const float CO_WARN = 35,    CO_DANGER = 200;      // ppm
+const float H2S_WARN = 10,   H2S_DANGER = 15;      // ppm
+const float O2_WARN = 19.5,  O2_DANGER = 16.0;     // % (low is bad)
+const float O2_HIGH = 23.5;                        // % enrichment alarm
+const float PM_TIER1 = 50,   PM_TIER2 = 150;       // ug/m3 PM2.5 -> fan tiers
+const float TEMP_WARN_C = 35.0;
+
+// MQ ppm curve constants (power law ppm = a * (Rs/R0)^b), "R0" = Rs in clean air / CLEAN_AIR_FACTOR.
+// Approximate values taken from common open-source libraries. VERIFY against your datasheet curves.
+const float MQ4_A = 1012.7f,  MQ4_B = -2.786f,  MQ4_CLEAN = 4.4f;
+const float MQ7_A = 99.042f,  MQ7_B = -1.518f,  MQ7_CLEAN = 27.5f;
+const float MQ136_A = 36.737f, MQ136_B = -3.536f, MQ136_CLEAN = 3.6f;
+
+// MEMS H2S sensor: conversion from voltage to ppm is NOT filled in (check your sensor datasheet).
+// Leave H2S_MEMS_PPM_PER_V at 0 to only log the raw millivolts and not use it for alarms.
+const float H2S_MEMS_V0 = 0.0f;
+const float H2S_MEMS_PPM_PER_V = 0.0f;
+
+// Fan duty per dust tier (percent). Test the lowest value on your real blower: some stall below ~30%.
+const uint8_t FAN_DUTY_PCT[3] = {35, 65, 100};
+const int FAN_PWM_FREQ = 25000;     // Hz
+const int FAN_PWM_BITS = 8;
+const int TACH_PULSES_PER_REV = 2;
+
+// Fall detection (starting values, tune with the helmet in your hand over a mattress)
+const float FREEFALL_G = 0.5f, IMPACT_G = 2.5f;
+const uint32_t FREEFALL_MIN_MS = 60, STILL_MS = 5000;
+const float TILT_ALARM_DEG = 60.0f, TILT_CLEAR_DEG = 40.0f;
+const uint32_t TILT_MS = 10000;
+
+const uint8_t DEBOUNCE_N = 3;       // consecutive 1 s samples needed to raise a level
+
+// ======================= TYPES =======================
+enum { FLAG_FALL = 1 << 0, FLAG_TILT = 1 << 1, FLAG_WARMUP = 1 << 2, FLAG_UNCAL = 1 << 3,
+       FLAG_BATT_LOW = 1 << 4, FLAG_BATT_CRIT = 1 << 5, FLAG_DUST_HIGH = 1 << 6,
+       FLAG_HOT = 1 << 7, FLAG_O2_HIGH = 1 << 8, FLAG_MUTED = 1 << 9 };
+enum { FAULT_BME = 1 << 0, FAULT_IMU = 1 << 1, FAULT_O2 = 1 << 2, FAULT_PMS = 1 << 3,
+       FAULT_MQ4 = 1 << 4, FAULT_MQ7 = 1 << 5, FAULT_MQ136 = 1 << 6 };
+
+struct __attribute__((packed)) Packet {   // keep identical in the base station sketch
+  uint8_t magic, ver, id, level, tier, faults;
+  uint16_t flags, seq;
+  uint16_t pm1, pm25, pm10;
+  uint16_t ch4, co, h2s10, o2_100;
+  int16_t temp100;
+  uint16_t hum100, vbat_mv, rpm, h2sMems_mv;
+  uint8_t xorsum;
+};
+
+struct Channel {
+  float warn, danger;
+  bool lowIsBad;
+  uint8_t level, cnt;
+  Channel(float w, float d, bool low = false) : warn(w), danger(d), lowIsBad(low), level(0), cnt(0) {}
+  void reset() { level = 0; cnt = 0; }
+  uint8_t update(float v) {
+    uint8_t target;
+    if (!lowIsBad) target = (v >= danger) ? 2 : (v >= warn) ? 1 : 0;
+    else           target = (v <= danger) ? 2 : (v <= warn) ? 1 : 0;
+    if (target > level) {
+      if (++cnt >= DEBOUNCE_N) { level = target; cnt = 0; }
+    } else if (target < level) {
+      cnt = 0;
+      float thr = (level == 2) ? danger : warn;          // threshold of the level we are leaving
+      bool cleared = lowIsBad ? (v > thr * 1.03f) : (v < thr * 0.8f);   // hysteresis
+      if (cleared) level--;
+    } else {
+      cnt = 0;
+    }
+    return level;
+  }
+};
+
+struct Readings {
+  float pm1 = 0, pm25 = 0, pm10 = 0;
+  float ch4 = 0, co = 0, h2s = 0, o2 = 20.9f, temp = 0, hum = 0, vbat = 0, mems_mv = 0;
+  uint16_t rpm = 0;
+} R;
+
+// ======================= GLOBALS =======================
+Preferences prefs;
+Adafruit_BME280 bme;
+DFRobot_OxygenSensor Oxygen;
+
+bool bmeOk = false, imuOk = false, o2Ok = false, loraOk = false;
+bool pmsEverOk = false, calibrated = false, muted = false;
+float r0_4 = 0, r0_7 = 0, r0_136 = 0;           // clean-air Rs (kOhm), saved in flash
+
+Channel chPM(PM_TIER1, PM_TIER2);
+Channel chCH4(CH4_WARN, CH4_DANGER), chCO(CO_WARN, CO_DANGER), chH2S(H2S_WARN, H2S_DANGER);
+Channel chO2(O2_WARN, O2_DANGER, true);
+Channel chBatt(VBAT_WARN_V, VBAT_CRIT_V, true);
+
+uint8_t level = 0, fanTier = 1, faults = 0;
+uint16_t flags = 0;
+uint16_t seqNo = 0;
+bool warmup = true, csvOn = true;
+int fanOverridePct = -1;
+float fanDuty = 0;
+
+uint8_t pmsBuf[32];
+uint8_t pmsIdx = 0;
+uint32_t lastPmsMs = 0;
+
+// IMU / fall state
+float gMag = 1.0f, tiltDeg = 0.0f, motionE = 0.0f;
+bool fallActive = false, tiltAlarm = false;
+enum { FS_IDLE, FS_FREEFALL, FS_WAIT_STILL } fs = FS_IDLE;
+uint32_t fsT = 0, lowSince = 0, calmSince = 0, moveSince = 0, tiltSince = 0;
+
+volatile uint32_t tachPulses = 0;
+void IRAM_ATTR tachIsr() { tachPulses++; }
+
+uint32_t tImu = 0, tSlow = 0, nextTx = 0, tFan = 0;
+
+// ======================= HELPERS =======================
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define PWM_ATTACH(pin) ledcAttach(pin, FAN_PWM_FREQ, FAN_PWM_BITS)
+  #define PWM_WRITE(pin, duty) ledcWrite(pin, duty)
+#else
+  #define PWM_ATTACH(pin) do { ledcSetup((pin) == PIN_BLOWER1 ? 0 : 1, FAN_PWM_FREQ, FAN_PWM_BITS); \
+                               ledcAttachPin(pin, (pin) == PIN_BLOWER1 ? 0 : 1); } while (0)
+  #define PWM_WRITE(pin, duty) ledcWrite((pin) == PIN_BLOWER1 ? 0 : 1, duty)
+#endif
+
+uint16_t clampU16(float v) { return v < 0 ? 0 : (v > 65535 ? 65535 : (uint16_t)(v + 0.5f)); }
+
+float adcMilliVolts(int pin) {
+  uint32_t acc = 0;
+  for (int i = 0; i < 16; i++) acc += analogReadMilliVolts(pin);
+  return acc / 16.0f;
+}
+
+float mqSensorVolts(int pin) { return adcMilliVolts(pin) / 1000.0f * MQ_DIV_RATIO; }
+
+float mqRs(float vs) {                       // kOhm
+  if (vs < 0.05f || vs >= MQ_VCC) return NAN;
+  return MQ_RL_KOHM * (MQ_VCC - vs) / vs;
+}
+
+float mqPpm(float rs, float r0clean, float cleanFactor, float a, float b) {
+  if (isnan(rs) || r0clean <= 0) return 0;
+  float ratio = rs / (r0clean / cleanFactor);
+  return a * powf(ratio, b);
+}
+
+// ======================= PMS5003 =======================
+void pollPMS() {
+#if USE_PMS
+  while (Serial2.available()) {
+    uint8_t b = Serial2.read();
+    if (pmsIdx == 0) { if (b == 0x42) pmsBuf[pmsIdx++] = b; continue; }
+    if (pmsIdx == 1) {
+      if (b == 0x4D) pmsBuf[pmsIdx++] = b;
+      else { pmsIdx = 0; if (b == 0x42) pmsBuf[pmsIdx++] = b; }
+      continue;
+    }
+    pmsBuf[pmsIdx++] = b;
+    if (pmsIdx == 32) {
+      pmsIdx = 0;
+      uint16_t sum = 0;
+      for (int i = 0; i < 30; i++) sum += pmsBuf[i];
+      uint16_t chk = ((uint16_t)pmsBuf[30] << 8) | pmsBuf[31];
+      if (sum == chk) {
+        R.pm1  = (pmsBuf[10] << 8) | pmsBuf[11];     // atmospheric environment values
+        R.pm25 = (pmsBuf[12] << 8) | pmsBuf[13];
+        R.pm10 = (pmsBuf[14] << 8) | pmsBuf[15];
+        lastPmsMs = millis();
+        pmsEverOk = true;
+        chPM.update(R.pm25);
+      }
+    }
+  }
+#endif
+}
+
+bool pmsFresh() { return pmsEverOk && (millis() - lastPmsMs < 5000); }
+
+// ======================= IMU (MPU6050, raw registers) =======================
+const uint8_t MPU_ADDR = 0x68;
+
+bool imuBegin() {
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00);          // wake
+  if (Wire.endTransmission() != 0) return false;
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1C); Wire.write(0x10);          // +/-8 g range (a +/-2 g range could never see the impact)
+  Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1A); Wire.write(0x03);          // low-pass ~44 Hz
+  Wire.endTransmission();
+  return true;
+}
+
+void updateImu(uint32_t now) {
+#if USE_IMU
+  if (!imuOk) return;
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return;
+  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)6) != 6) return;
+  uint8_t raw[6];                                   // read in order: C++ does not fix the order of two calls in one expression
+  for (int i = 0; i < 6; i++) raw[i] = Wire.read();
+  int16_t rx = (int16_t)((raw[0] << 8) | raw[1]);
+  int16_t ry = (int16_t)((raw[2] << 8) | raw[3]);
+  int16_t rz = (int16_t)((raw[4] << 8) | raw[5]);
+  const float LSB_PER_G = 4096.0f;                  // +/-8 g range
+  float ax = rx / LSB_PER_G, ay = ry / LSB_PER_G, az = rz / LSB_PER_G;
+  gMag = sqrtf(ax * ax + ay * ay + az * az);
+
+  // Assumes the sensor Z axis points UP when the helmet is worn upright. Re-map if you mount it differently.
+  float c = (gMag > 0.1f) ? az / gMag : 1.0f;
+  if (c > 1) c = 1;
+  if (c < -1) c = -1;
+  tiltDeg = acosf(c) * 57.2958f;
+
+  motionE = 0.98f * motionE + 0.02f * fabsf(gMag - 1.0f);
+
+  switch (fs) {
+    case FS_IDLE:
+      if (gMag < FREEFALL_G) {
+        if (!lowSince) lowSince = now;
+        if (now - lowSince >= FREEFALL_MIN_MS) { fs = FS_FREEFALL; fsT = now; }
+      } else lowSince = 0;
+      break;
+    case FS_FREEFALL:
+      if (gMag > IMPACT_G) { fs = FS_WAIT_STILL; fsT = now; calmSince = 0; }
+      else if (now - fsT > 1000) { fs = FS_IDLE; lowSince = 0; }
+      break;
+    case FS_WAIT_STILL:
+      if (now - fsT >= 1000) {                      // ignore the first second of bouncing
+        if (motionE < 0.05f) {
+          if (!calmSince) calmSince = now;
+          if (now - calmSince >= STILL_MS) { fallActive = true; fs = FS_IDLE; lowSince = 0; }
+        } else calmSince = 0;
+      }
+      if (now - fsT > 20000) { fs = FS_IDLE; lowSince = 0; }
+      break;
+  }
+
+  if (fallActive) {                                  // clear after sustained movement
+    if (motionE > 0.10f) { if (!moveSince) moveSince = now; if (now - moveSince >= 3000) fallActive = false; }
+    else moveSince = 0;
+  }
+
+  if (tiltDeg > TILT_ALARM_DEG) {
+    if (!tiltSince) tiltSince = now;
+    if (now - tiltSince >= TILT_MS) tiltAlarm = true;
+  } else if (tiltDeg < TILT_CLEAR_DEG) { tiltSince = 0; tiltAlarm = false; }
+#endif
+}
+
+// ======================= CALIBRATION =======================
+void calibrateMQ() {
+  Serial.println(F("MQ clean-air calibration: keep the helmet in clean air for 30 s..."));
+  float s4 = 0, s7 = 0, s136 = 0; int n = 0;
+  for (int i = 0; i < 60; i++) {
+    float a = mqRs(mqSensorVolts(PIN_MQ4)), b = mqRs(mqSensorVolts(PIN_MQ7)), c = mqRs(mqSensorVolts(PIN_MQ136));
+    if (!isnan(a) && !isnan(b) && !isnan(c)) { s4 += a; s7 += b; s136 += c; n++; }
+    pollPMS(); delay(500);
+  }
+  if (n < 30) { Serial.println(F("Calibration failed: sensor voltages out of range. Check wiring/dividers.")); return; }
+  r0_4 = s4 / n; r0_7 = s7 / n; r0_136 = s136 / n;
+  prefs.putFloat("r0_4", r0_4); prefs.putFloat("r0_7", r0_7); prefs.putFloat("r0_136", r0_136);
+  calibrated = true;
+  Serial.printf("Saved. Clean-air Rs (kOhm): MQ4=%.2f MQ7=%.2f MQ136=%.2f\n", r0_4, r0_7, r0_136);
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    switch (c) {
+      case 'h': Serial.println(F("c=calibrate MQ in clean air | o=calibrate O2 in fresh air | m=mute buzzer | "
+                                 "r=reset fall latch | d=CSV on/off | f=fan test step (0/35/65/100/auto)")); break;
+      case 'c': calibrateMQ(); break;
+      case 'o': if (o2Ok) { Oxygen.calibrate(20.9, 0); Serial.println(F("O2 calibrated to 20.9%")); } break;
+      case 'm': muted = !muted; Serial.println(muted ? F("buzzer muted") : F("buzzer on")); break;
+      case 'r': fallActive = false; tiltAlarm = false; Serial.println(F("fall/tilt latch cleared")); break;
+      case 'd': csvOn = !csvOn; break;
+      case 'f': {
+        const int steps[5] = {0, 35, 65, 100, -1};
+        static int idx = 4; idx = (idx + 1) % 5; fanOverridePct = steps[idx];
+        Serial.printf("fan override: %d (-1 = auto)\n", fanOverridePct); break; }
+      default: break;
+    }
+  }
+}
+
+// ======================= FAN =======================
+void updateFanTier() {
+  fanTier = chPM.level;
+  // Fusion boost: dust and rising CO together look like blasting fumes or fire, so step the fan up one tier.
+  if (!warmup && calibrated && chCO.level >= 1 && chPM.level >= 1 && fanTier < 2) fanTier++;
+}
+
+void updateFan(uint32_t now) {
+  if (now - tFan < 20) return;
+  tFan = now;
+  float target;
+  if (fanOverridePct >= 0) target = fanOverridePct;
+  else if (!pmsFresh())    target = FAN_DUTY_PCT[1];     // fail-safe: never switch the fan off blind
+  else                     target = FAN_DUTY_PCT[fanTier];
+  if (fanDuty < target) fanDuty = min(fanDuty + 2.0f, target);   // soft start / ramp (limits inrush)
+  else if (fanDuty > target) fanDuty = max(fanDuty - 2.0f, target);
+  uint32_t d = (uint32_t)(fanDuty * ((1 << FAN_PWM_BITS) - 1) / 100.0f);
+  PWM_WRITE(PIN_BLOWER1, d);
+  PWM_WRITE(PIN_BLOWER2, d);
+}
+
+// ======================= INDICATORS =======================
+void updateIndicators(uint32_t now) {
+  bool g = false, y = false, r = false, buz = false;
+  if (level >= 2)      { r = true; buz = (now % 300) < 150; }
+  else if (level == 1) { y = true; buz = (now % 2000) < 150; }
+  else if (warmup)     { y = (now % 1000) < 500; }
+  else                 { g = true; }
+  digitalWrite(PIN_LED_GRN, g); digitalWrite(PIN_LED_YEL, y); digitalWrite(PIN_LED_RED, r);
+  digitalWrite(PIN_BUZZER, (buz && !muted) ? HIGH : LOW);
+}
+
+// ======================= SLOW TICK (1 Hz) =======================
+void slowTick(uint32_t now) {
+  warmup = now < WARMUP_MS;
+  faults = 0;
+
+#if USE_BME280
+  if (bmeOk) {
+    R.temp = bme.readTemperature(); R.hum = bme.readHumidity();
+    if (isnan(R.temp) || isnan(R.hum)) faults |= FAULT_BME;
+  } else faults |= FAULT_BME;
+#endif
+#if USE_O2
+  if (o2Ok) {
+    float v = Oxygen.getOxygenData(10);
+    if (isnan(v) || v < 0 || v > 30) faults |= FAULT_O2; else R.o2 = v;
+  } else faults |= FAULT_O2;
+#endif
+#if USE_IMU
+  if (!imuOk) faults |= FAULT_IMU;
+#endif
+#if USE_PMS
+  if (!pmsFresh()) faults |= FAULT_PMS;
+#endif
+
+  float v4 = mqSensorVolts(PIN_MQ4), v7 = mqSensorVolts(PIN_MQ7), v136 = mqSensorVolts(PIN_MQ136);
+  if (v4 < 0.1f || v4 > 4.9f) faults |= FAULT_MQ4;
+  if (v7 < 0.1f || v7 > 4.9f) faults |= FAULT_MQ7;
+  if (v136 < 0.1f || v136 > 4.9f) faults |= FAULT_MQ136;
+  R.ch4 = mqPpm(mqRs(v4), r0_4, MQ4_CLEAN, MQ4_A, MQ4_B);
+  R.co  = mqPpm(mqRs(v7), r0_7, MQ7_CLEAN, MQ7_A, MQ7_B);
+  float h2sMq = mqPpm(mqRs(v136), r0_136, MQ136_CLEAN, MQ136_A, MQ136_B);
+  R.mems_mv = adcMilliVolts(PIN_H2S_MEMS);
+  float h2sMems = (H2S_MEMS_PPM_PER_V > 0) ? max(0.0f, (R.mems_mv / 1000.0f - H2S_MEMS_V0) * H2S_MEMS_PPM_PER_V) : 0;
+  R.h2s = max(h2sMq, h2sMems);
+
+  R.vbat = adcMilliVolts(PIN_VBAT) / 1000.0f * VBAT_DIV_RATIO;
+
+  // fan tach
+  noInterrupts(); uint32_t p = tachPulses; tachPulses = 0; interrupts();
+  R.rpm = (uint16_t)(p * 60UL / TACH_PULSES_PER_REV);
+
+  // ---- alarm channels ----
+  bool gasValid = !warmup && calibrated;
+  if (gasValid && !(faults & FAULT_MQ4))   chCH4.update(R.ch4); else chCH4.reset();
+  if (gasValid && !(faults & FAULT_MQ7))   chCO.update(R.co);   else chCO.reset();
+  if (gasValid && !(faults & FAULT_MQ136)) chH2S.update(R.h2s); else chH2S.reset();
+  if (!warmup && o2Ok && !(faults & FAULT_O2)) chO2.update(R.o2); else chO2.reset();
+  chBatt.update(R.vbat);
+  updateFanTier();
+
+  // ---- fusion into one level ----
+  uint8_t lv = 0;
+  lv = max(lv, max(max(chCH4.level, chCO.level), max(chH2S.level, chO2.level)));
+  if (fallActive || tiltAlarm) lv = 2;
+  if (chBatt.level == 2) lv = 2;
+  if (chPM.level == 2 || chBatt.level == 1 || faults) lv = max(lv, (uint8_t)1);
+  if (R.temp > TEMP_WARN_C) lv = max(lv, (uint8_t)1);
+  if (o2Ok && R.o2 > O2_HIGH) lv = max(lv, (uint8_t)1);
+  level = lv;
+
+  flags = 0;
+  if (fallActive) flags |= FLAG_FALL;
+  if (tiltAlarm) flags |= FLAG_TILT;
+  if (warmup) flags |= FLAG_WARMUP;
+  if (!calibrated) flags |= FLAG_UNCAL;
+  if (chBatt.level >= 1) flags |= FLAG_BATT_LOW;
+  if (chBatt.level == 2) flags |= FLAG_BATT_CRIT;
+  if (chPM.level == 2) flags |= FLAG_DUST_HIGH;
+  if (R.temp > TEMP_WARN_C) flags |= FLAG_HOT;
+  if (o2Ok && R.o2 > O2_HIGH) flags |= FLAG_O2_HIGH;
+  if (muted) flags |= FLAG_MUTED;
+
+  if (csvOn) {
+    Serial.printf("%lu,%.0f,%.0f,%.0f,%.0f,%.1f,%.1f,%.2f,%.1f,%.0f,%.2f,%u,%u,%u,%u,%u,%.2f\n",
+                  (unsigned long)now, R.pm1, R.pm25, R.pm10, R.ch4, R.co, R.h2s, R.o2, R.temp, R.hum,
+                  R.vbat, R.rpm, fanTier, level, flags, faults, tiltDeg);
+  }
+}
+
+// ======================= LoRa TX =======================
+void maybeTransmit(uint32_t now) {
+  if (!loraOk || now < nextTx || LoRa.isTransmitting()) return;
+  Packet p;
+  p.magic = 0xA5; p.ver = 1; p.id = HELMET_ID; p.level = level; p.tier = fanTier; p.faults = faults;
+  p.flags = flags; p.seq = seqNo++;
+  p.pm1 = clampU16(R.pm1); p.pm25 = clampU16(R.pm25); p.pm10 = clampU16(R.pm10);
+  p.ch4 = clampU16(R.ch4); p.co = clampU16(R.co); p.h2s10 = clampU16(R.h2s * 10.0f);
+  p.o2_100 = clampU16(R.o2 * 100.0f);
+  p.temp100 = (int16_t)constrain(R.temp * 100.0f, -3000, 12000);
+  p.hum100 = clampU16(R.hum * 100.0f);
+  p.vbat_mv = clampU16(R.vbat * 1000.0f);
+  p.rpm = R.rpm; p.h2sMems_mv = clampU16(R.mems_mv);
+  uint8_t x = 0; const uint8_t* b = (const uint8_t*)&p;
+  for (size_t i = 0; i < sizeof(Packet) - 1; i++) x ^= b[i];
+  p.xorsum = x;
+  LoRa.beginPacket();
+  LoRa.write((const uint8_t*)&p, sizeof(Packet));
+  LoRa.endPacket(true);                       // async: do not block the fall detector
+  nextTx = now + (level ? TX_PERIOD_ALERT_MS : TX_PERIOD_OK_MS) + random(0, 400);   // jitter avoids collisions
+}
+
+// ======================= SETUP / LOOP =======================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_LED_GRN, OUTPUT); pinMode(PIN_LED_YEL, OUTPUT); pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_LED_YEL, HIGH);                      // lamp test at boot
+  pinMode(PIN_TACH, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_TACH), tachIsr, FALLING);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  pinMode(PIN_MQ4, INPUT); pinMode(PIN_MQ7, INPUT); pinMode(PIN_MQ136, INPUT);
+  pinMode(PIN_H2S_MEMS, INPUT); pinMode(PIN_VBAT, INPUT);
+
+  PWM_ATTACH(PIN_BLOWER1); PWM_ATTACH(PIN_BLOWER2);
+  PWM_WRITE(PIN_BLOWER1, 0); PWM_WRITE(PIN_BLOWER2, 0);
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
+  Serial2.begin(9600, SERIAL_8N1, PIN_PMS_RX, PIN_PMS_TX);
+
+  prefs.begin("g68", false);
+  r0_4 = prefs.getFloat("r0_4", 0); r0_7 = prefs.getFloat("r0_7", 0); r0_136 = prefs.getFloat("r0_136", 0);
+  calibrated = (r0_4 > 0 && r0_7 > 0 && r0_136 > 0);
+
+#if USE_BME280
+  bmeOk = bme.begin(0x76);
+#endif
+#if USE_IMU
+  imuOk = imuBegin();
+#endif
+#if USE_O2
+  o2Ok = Oxygen.begin(ADDRESS_3);                       // 0x73, check the DIP switch on the module
+#endif
+
+  SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
+  LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
+  loraOk = LoRa.begin(LORA_FREQ);
+  if (loraOk) {
+    LoRa.setSpreadingFactor(9); LoRa.setSignalBandwidth(125E3); LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(LORA_SYNC_WORD); LoRa.enableCrc(); LoRa.setTxPower(LORA_TX_DBM);
+  }
+
+  Serial.printf("\nG68 helmet #%d | BME:%d IMU:%d O2:%d LoRa:%d | MQ calibrated:%d\n",
+                HELMET_ID, bmeOk, imuOk, o2Ok, loraOk, calibrated);
+  if (!calibrated) Serial.println(F("MQ sensors NOT calibrated: gas alarms are disabled. Send 'c' in clean air after warm-up."));
+  Serial.println(F("Send 'h' for commands. CSV columns: ms,pm1,pm25,pm10,ch4,co,h2s,o2,temp,hum,vbat,rpm,tier,level,flags,faults,tilt"));
+  digitalWrite(PIN_LED_YEL, LOW);
+}
+
+void loop() {
+  uint32_t now = millis();
+  handleSerial();
+  pollPMS();
+  if (now - tImu >= 10) { tImu = now; updateImu(now); }
+  if (now - tSlow >= 1000) { tSlow = now; slowTick(now); }
+  updateFan(now);
+  updateIndicators(now);
+  maybeTransmit(now);
+}
